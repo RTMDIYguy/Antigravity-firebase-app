@@ -1,10 +1,12 @@
 import { DirectoryContext } from '@cmt/workspace';
+import * as fs_ from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import * as xml2js from 'xml2js';
 import * as zlib from 'zlib';
 
 import { CMakeDriver } from '@cmt/drivers/drivers';
+import { CodeModelContent } from '@cmt/drivers/codeModel';
 import * as logging from '@cmt/logging';
 import { fs } from '@cmt/pr';
 import * as util from '@cmt/util';
@@ -17,6 +19,7 @@ import { extensionManager } from '@cmt/extension';
 import { CMakeProject } from '@cmt/cmakeProject';
 import { handleCoverageInfoFiles } from '@cmt/coverage';
 import { CommandResult } from 'vscode-cmake-tools';
+import { FailurePattern, FailurePatternsConfig } from '@cmt/config';
 
 nls.config({ messageFormat: nls.MessageFormat.bundle, bundleFormat: nls.BundleFormat.standalone })();
 const localize: nls.LocalizeFunc = nls.loadMessageBundle();
@@ -26,6 +29,10 @@ const log = logging.createLogger('ctest');
 const magicKey = 'ctest.magic.key';
 // Used as magic value
 let sessionNum = 0;
+
+// Session-scoped set: tracks which workspaces (by settings.json identity) have already been prompted
+// about neverDebugTestsWithLaunchConfiguration. Each workspace gets prompted at most once per session.
+const promptedNeverDebugWithLaunchWorkspaces = new Set<string>();
 
 // Placeholder in the test explorer when test preset is not selected
 const testPresetRequired = '_test_preset_required_';
@@ -137,6 +144,143 @@ interface ProjectCoverageConfig {
     coverageInfoFiles: string[];
 }
 
+export function searchOutputForFailures(patterns: FailurePatternsConfig, output: string): vscode.TestMessage[] {
+    output = util.normalizeLF(output);
+    const messages = [];
+    patterns = Array.isArray(patterns) ? patterns : [patterns];
+    for (let pattern of patterns) {
+        pattern = typeof pattern === 'string' ? { regexp: pattern } : pattern;
+        pattern.file ??= 1;
+        pattern.line ??= 2;
+        pattern.message ??= 3;
+
+        try {
+            for (const match of output.matchAll(RegExp(pattern.regexp, "g"))) {
+                if (pattern.file && match[pattern.file]) {
+                    messages.push(matchToTestMessage(pattern, match));
+                }
+            }
+        } catch (e) {
+            console.error(e);
+        }
+    }
+    return messages;
+}
+
+/**
+ * Finds the minimal regex fragments to match targets from the superset.
+ * If a target is a prefix of a forbidden string, it returns an exact match.
+ * Otherwise, it returns a minimal prefix.
+ *
+ * @param superset : the list of all individual test names (individual and or group names)
+ * @param targets : the list of test names (individual and or group names) we want to match.
+ * @returns : the list of regex fragments to match the targets without matching any other test from the superset
+ */
+export function getMinimalRegexFragments(superset: string[], targets: string[]): string[] {
+    interface TrieNode {
+        children: Map<string, TrieNode>;
+        forbiddenCount: number;
+    }
+
+    const targetSet = new Set(targets);
+    const forbidden = superset.filter(s => !targetSet.has(s));
+
+    if (targets.length === 0) {
+        return [];
+    }
+    if (forbidden.length === 0) {
+        return ["^."];
+    }
+
+    const root: TrieNode = { children: new Map(), forbiddenCount: 0 };
+
+    // 1. Build Trie with forbidden strings
+    for (const s of forbidden) {
+        let current = root;
+        for (const char of s) {
+            if (!current.children.has(char)) {
+                current.children.set(char, { children: new Map(), forbiddenCount: 0 });
+            }
+            current = current.children.get(char)!;
+            current.forbiddenCount++;
+        }
+    }
+
+    const fragmentSet = new Set<string>();
+
+    // 2. Identify the optimal regex fragment for each target
+    for (const target of targets) {
+        let current = root;
+        let prefix = "";
+        let foundUnique = false;
+
+        for (const char of target) {
+            prefix += char;
+            const next = current.children.get(char);
+
+            if (!next || next.forbiddenCount === 0) {
+                // Safe unique prefix found
+                fragmentSet.add(`^${util.escapeStringForRegex(prefix)}`);
+                foundUnique = true;
+                break;
+            }
+            current = next;
+        }
+
+        // 3. The "Swallowed" Target Case
+        // Target is a prefix of a forbidden string (e.g., "Test" vs "Test.1")
+        if (!foundUnique) {
+            fragmentSet.add(`^${util.escapeStringForRegex(target)}$`);
+        }
+    }
+
+    // 4. Remove redundant fragments
+    // Sort by length: "Test\." (length 6) comes before "Test\.x\.1" (length 10)
+    const sorted = Array.from(fragmentSet).sort((a, b) => a.length - b.length);
+    const minimalFragments: string[] = [];
+
+    for (const fragment of sorted) {
+        // If we already have a prefix that covers this fragment, skip it.
+        // Note: 'existing' only matches 'fragment' if it's a true prefix (no $ anchor)
+        const isRedundant = minimalFragments.some(existing => {
+            if (existing.endsWith('$')) {
+                return false; // Exact matches can't cover other things
+            }
+            return fragment.startsWith(existing);
+        });
+
+        if (!isRedundant) {
+            minimalFragments.push(fragment);
+        }
+    }
+
+    return minimalFragments;
+}
+
+function matchToTestMessage(pat: FailurePattern, match: RegExpMatchArray): vscode.TestMessage {
+    const file = match[pat.file as number];
+    const line = pat.line ? parseLineMatch(match[pat.line]) : 0;
+    const message = pat.message && match[pat.message]?.trim() || 'Test Failed';
+    const actual = pat.actual ? match[pat.actual] : undefined;
+    const expected = pat.expected ? match[pat.expected] : undefined;
+
+    const testMessage = new vscode.TestMessage(util.normalizeCRLF(message));
+    testMessage.location = new vscode.Location(
+        vscode.Uri.file(file), new vscode.Position(line, 0)
+    );
+    testMessage.expectedOutput = expected;
+    testMessage.actualOutput = actual;
+    return testMessage;
+}
+
+function parseLineMatch(line: string | null) {
+    const i = parseInt(line || '');
+    if (i) {
+        return i - 1;
+    }
+    return 0;
+}
+
 function parseXmlString<T>(xml: string): Promise<T> {
     return new Promise((resolve, reject) => {
         xml2js.parseString(xml, (err, result) => {
@@ -155,7 +299,7 @@ function decodeOutputMeasurement(node: EncodedMeasurementValue | string): string
     }
     let buffer = !!node.$.encoding ? Buffer.from(node._, node.$.encoding) : Buffer.from(node._, 'utf-8');
     if (!!node.$.compression) {
-        buffer = zlib.unzipSync(buffer);
+        buffer = zlib.unzipSync(buffer as Uint8Array);
     }
     return buffer.toString('utf-8');
 }
@@ -233,6 +377,14 @@ interface TestAndParentSuite {
 }
 
 type TestsType = "CTestInfo" | "LegacyCTest";
+
+interface ConfigItem extends vscode.QuickPickItem {
+    label: string;
+    config: vscode.DebugConfiguration;
+    detail: string;
+    // Undefined for workspace launch config
+    folder?: vscode.WorkspaceFolder;
+}
 
 export class CTestDriver implements vscode.Disposable {
     /**
@@ -381,7 +533,8 @@ export class CTestDriver implements vscode.Disposable {
         const ctestArgs = await this.getCTestArgs(driver, customizedTask, testPreset) || [];
         if (testsToRun && testsToRun.length > 0) {
             ctestArgs.push("-R");
-            const testsNamesRegex = testsToRun.map(t => `^${util.escapeStringForRegex(t)}\$`).join('|');
+            const superset = this.getTestNamesForSourceDir(driver.sourceDir) || [];
+            const testsNamesRegex = getMinimalRegexFragments(superset, testsToRun).join('|');
             ctestArgs.push(testsNamesRegex);
         }
 
@@ -439,7 +592,13 @@ export class CTestDriver implements vscode.Disposable {
         } else {
             log.info(message.message);
         }
-        run.failed(test, message, duration);
+        const outputMessages = searchOutputForFailures(
+            this.ws.config.ctestFailurePatterns as FailurePatternsConfig,
+            // string cast OK; never passed TestMessage with MarkdownString message
+            message.message as string
+        );
+        const messages = outputMessages.length ? outputMessages : message;
+        run.failed(test, messages, duration);
     }
 
     /**
@@ -538,6 +697,8 @@ export class CTestDriver implements vscode.Disposable {
 
         if (!this.ws.config.ctestAllowParallelJobs) {
             for (const driver of driverMap.values()) {
+                // Sort tests alphabetically by label to match the Test Explorer display order.
+                driver.tests.sort((a, b) => (a.label).localeCompare(b.label));
                 for (const test of driver.tests) {
                     if (cancellation && cancellation.isCancellationRequested) {
                         run.skipped(test);
@@ -546,7 +707,8 @@ export class CTestDriver implements vscode.Disposable {
 
                     run.started(test);
 
-                    const _ctestArgs = driver.ctestArgs.concat('-R', `^${util.escapeStringForRegex(test.id)}\$`);
+                    const superset = this.getTestNamesForSourceDir(driver.driver.sourceDir) || [];
+                    const _ctestArgs = driver.ctestArgs.concat('-R', getMinimalRegexFragments(superset, [test.id]).join('|'));
 
                     const testResults = await this.runCTestImpl(driver.driver, driver.ctestPath, _ctestArgs, cancellation, customizedTask, consumer);
 
@@ -584,21 +746,22 @@ export class CTestDriver implements vscode.Disposable {
                 // then there may be a scenario when the user requested only a subset of tests to be ran.
                 // In this case, we should specifically use the -R flag to select the exact tests.
                 // Otherwise, we can leave it to the -T flag to run all tests.
-                if (entryPoint === RunCTestHelperEntryPoint.TestExplorer && testExplorer && this._tests && this._tests.tests.length !== driver.tests.length) {
-                    uniqueCtestArgs.push("-R");
-                    const testsNamesRegex = driver.tests.map(t => {
-                        run.started(t);
-                        return `^${util.escapeStringForRegex(t.id)}\$`;
-                    }).join('|');
-                    uniqueCtestArgs.push(testsNamesRegex);
+                let targetTests: vscode.TestItem[] | undefined;
+                const allTestNamesForDriver = this.getTestNamesForSourceDir(uniqueDriver.sourceDir);
+                if (entryPoint === RunCTestHelperEntryPoint.TestExplorer && testExplorer && allTestNamesForDriver && allTestNamesForDriver.length !== driver.tests.length) {
+                    targetTests = driver.tests;
                 } else if (testsToRun && testsToRun.length > 0) {
+                    targetTests = driver.tests.filter(t => testsToRun.includes(t.id));
+                }
+
+                if (targetTests) {
                     uniqueCtestArgs.push("-R");
-                    const tests = driver.tests.filter(t => testsToRun.includes(t.id));
-                    const testsNamesRegex = tests.map(t => {
+                    const superset = allTestNamesForDriver || [];
+                    const targets = targetTests.map(t => {
                         run.started(t);
-                        return `^${util.escapeStringForRegex(t.id)}\$`;
-                    }).join('|');
-                    uniqueCtestArgs.push(testsNamesRegex);
+                        return t.id;
+                    });
+                    uniqueCtestArgs.push(getMinimalRegexFragments(superset, targets).join('|'));
                 }
 
                 const testResults = await this.runCTestImpl(uniqueDriver, uniqueCtestPath, uniqueCtestArgs, cancellation, customizedTask, consumer);
@@ -637,7 +800,7 @@ export class CTestDriver implements vscode.Disposable {
 
         let output = testResult.output;
         // https://code.visualstudio.com/api/extension-guides/testing#test-output
-        output = output.replace(/\r?\n/g, '\r\n');
+        output = util.normalizeCRLF(output);
         if (test.uri && test.range) {
             run.appendOutput(output, new vscode.Location(test.uri, test.range.end), test);
         } else {
@@ -728,6 +891,238 @@ export class CTestDriver implements vscode.Disposable {
         return undefined;
     }
 
+    /**
+     * Builds a map from normalized executable paths to source file information
+     * by looking at the code model content from the CMake driver.
+     */
+    private buildExecutableToSourcesMap(codeModelContent: CodeModelContent | null): Map<string, { sourceDir: string; sources: string[] }> {
+        const map = new Map<string, { sourceDir: string; sources: string[] }>();
+        if (!codeModelContent) {
+            return map;
+        }
+        for (const config of codeModelContent.configurations) {
+            for (const project of config.projects) {
+                for (const target of project.targets) {
+                    if (target.artifacts && target.fileGroups && target.sourceDirectory) {
+                        // Collect compilable (non-generated) source files from file groups
+                        const sources: string[] = [];
+                        for (const fg of target.fileGroups) {
+                            if (fg.language && !fg.isGenerated && fg.sources) {
+                                sources.push(...fg.sources);
+                            }
+                        }
+                        if (sources.length > 0) {
+                            for (const artifact of target.artifacts) {
+                                const normalizedArtifact = util.platformNormalizePath(artifact);
+                                map.set(normalizedArtifact, { sourceDir: target.sourceDirectory, sources });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return map;
+    }
+
+    /**
+     * Resolves the source file and line number for a single CTest test entry.
+     * Uses a 3-step priority:
+     *  1) DEF_SOURCE_LINE test property
+     *  2) Code model executable-to-sources matching
+     *  3) Backtrace graph (falls back to CMakeLists.txt)
+     */
+    private resolveTestSourceLocation(
+        test: CTestInfo['tests'][0],
+        executableToSources: Map<string, { sourceDir: string; sources: string[] }> | undefined,
+        backtraceGraph: CTestInfo['backtraceGraph'] | undefined
+    ): { file?: string; line?: number } {
+        let file: string | undefined;
+        let line: number | undefined;
+
+        const resolvedFromExecutableSources = this.tryResolveTestSourceFromExecutableSources(test, executableToSources);
+        if (resolvedFromExecutableSources) {
+            return resolvedFromExecutableSources;
+        }
+
+        // 1. Use DEF_SOURCE_LINE CMake test property
+        const defSourceLineProperty = test.properties.filter(p => p.name === "DEF_SOURCE_LINE")[0];
+        if (defSourceLineProperty && defSourceLineProperty.value && typeof defSourceLineProperty.value === 'string') {
+            const match = defSourceLineProperty.value.match(/(.*):(\d+)/);
+            if (match && match[1] && match[2]) {
+                file = match[1];
+                line = parseInt(match[2]);
+                if (isNaN(line)) {
+                    line = undefined;
+                    file = undefined;
+                }
+            }
+        }
+
+        // 2. Match test executable to CMake target sources
+        if (!file && test.command && test.command.length > 0 && executableToSources) {
+            const testExe = util.platformNormalizePath(test.command[0]);
+            const targetInfo = executableToSources.get(testExe);
+            if (targetInfo && targetInfo.sources.length > 0) {
+                file = path.resolve(targetInfo.sourceDir, targetInfo.sources[0]);
+                line = 1;
+            }
+        }
+
+        // 3. Backtrace graph (falls back to CMakeLists.txt)
+        if (!file && backtraceGraph) {
+            const nodes = backtraceGraph.nodes;
+            if (test.backtrace !== undefined && nodes[test.backtrace] !== undefined) {
+                let node = nodes[test.backtrace];
+                while (node.parent !== undefined && nodes[node.parent].command !== undefined) {
+                    node = nodes[node.parent];
+                }
+                file = backtraceGraph.files[node.file];
+                line = node.line;
+            }
+        }
+
+        // For doctest and similar frameworks, CTest may only resolve the source file
+        // and default the line to 1. If we have a concrete source file, try to find a
+        // matching TEST_CASE("name") declaration in that file so each test gets its own range.
+        if (file && (line === undefined || line === 1)) {
+            line = this.tryResolveDoctestLine(file, test.name) ?? line;
+        }
+
+        return { file, line };
+    }
+
+    private tryResolveTestSourceFromExecutableSources(
+        test: CTestInfo['tests'][0],
+        executableToSources: Map<string, { sourceDir: string; sources: string[] }> | undefined
+    ): { file: string; line: number } | undefined {
+        if (!test.command || test.command.length === 0 || !executableToSources) {
+            return undefined;
+        }
+
+        const testExe = util.platformNormalizePath(test.command[0]);
+        const targetInfo = executableToSources.get(testExe);
+        if (!targetInfo) {
+            return undefined;
+        }
+
+        for (const source of targetInfo.sources) {
+            const candidateFile = path.resolve(targetInfo.sourceDir, source);
+            const candidateLine = this.tryResolveDoctestLine(candidateFile, test.name);
+            if (candidateLine !== undefined) {
+                return {
+                    file: candidateFile,
+                    line: candidateLine
+                };
+            }
+        }
+
+        return undefined;
+    }
+
+    private tryResolveDoctestLine(filePath: string, testName: string): number | undefined {
+        try {
+            if (!fs_.existsSync(filePath)) {
+                return undefined;
+            }
+
+            const content = fs_.readFileSync(filePath, 'utf8');
+            const parsedCases = this.parseDoctestCases(content);
+            if (parsedCases.length === 0) {
+                return undefined;
+            }
+
+            const normalizedTarget = this.normalizeDiscoveredTestName(testName);
+
+            const exactMatch = parsedCases.find(testCase => testCase.name === testName);
+            if (exactMatch) {
+                return exactMatch.line;
+            }
+
+            const normalizedExactMatch = parsedCases.find(testCase => testCase.normalizedName === normalizedTarget);
+            if (normalizedExactMatch) {
+                return normalizedExactMatch.line;
+            }
+
+            const normalizedContainsMatch = parsedCases.find(testCase =>
+                normalizedTarget.includes(testCase.normalizedName) || testCase.normalizedName.includes(normalizedTarget)
+            );
+            if (normalizedContainsMatch) {
+                return normalizedContainsMatch.line;
+            }
+
+            // Final fallback: choose the closest fuzzy match by token overlap.
+            const targetTokens = new Set(normalizedTarget.split(' ').filter(token => token.length > 0));
+            let bestLine: number | undefined;
+            let bestScore = 0;
+            for (const parsedCase of parsedCases) {
+                const caseTokens = parsedCase.normalizedName.split(' ').filter(token => token.length > 0);
+                if (caseTokens.length === 0 || targetTokens.size === 0) {
+                    continue;
+                }
+
+                let overlap = 0;
+                for (const token of caseTokens) {
+                    if (targetTokens.has(token)) {
+                        overlap++;
+                    }
+                }
+
+                if (overlap > bestScore) {
+                    bestScore = overlap;
+                    bestLine = parsedCase.line;
+                }
+            }
+
+            if (bestScore > 0) {
+                return bestLine;
+            }
+
+            return undefined;
+        } catch (e) {
+            log.trace(localize('failed.to.resolve.doctest.line', 'Failed to resolve doctest source line for {0}: {1}', testName, String(e)));
+            return undefined;
+        }
+    }
+
+    private parseDoctestCases(content: string): { name: string; normalizedName: string; line: number }[] {
+        const parsedCases: { name: string; normalizedName: string; line: number }[] = [];
+        const doctestQuotedRegex = /\b(?:TEST_CASE(?:_FIXTURE)?|TEST_CASE_TEMPLATE(?:_DEFINE|_INVOKE)?|TEMPLATE_TEST_CASE(?:_SIG)?|SCENARIO)\s*\(\s*"((?:\\"|[^"])*)"/g;
+        const doctestRawRegex = /\b(?:TEST_CASE(?:_FIXTURE)?|TEST_CASE_TEMPLATE(?:_DEFINE|_INVOKE)?|TEMPLATE_TEST_CASE(?:_SIG)?|SCENARIO)\s*\(\s*R"([A-Za-z0-9_]*)\((.*?)\)\1"/gs;
+
+        const addCase = (name: string, index: number) => {
+            const trimmed = name.trim();
+            if (!trimmed) {
+                return;
+            }
+
+            parsedCases.push({
+                name: trimmed,
+                normalizedName: this.normalizeDiscoveredTestName(trimmed),
+                line: content.slice(0, index).split(/\r\n|\r|\n/).length
+            });
+        };
+
+        let match: RegExpExecArray | null;
+        while ((match = doctestQuotedRegex.exec(content)) !== null) {
+            addCase(match[1], match.index);
+        }
+        while ((match = doctestRawRegex.exec(content)) !== null) {
+            addCase(match[2], match.index);
+        }
+
+        return parsedCases;
+    }
+
+    private normalizeDiscoveredTestName(testName: string): string {
+        return testName
+            .toLowerCase()
+            .replace(/^\s*scenario:\s*/, '')
+            .replace(/\[[^\]]*\]/g, ' ')
+            .replace(/[^a-z0-9]+/g, ' ')
+            .trim()
+            .replace(/\s+/g, ' ');
+    }
+
     private createTestItemAndSuiteTree(testName: string, testExplorerRoot: vscode.TestItem, initializedTestExplorer: vscode.TestController, uri?: vscode.Uri): TestAndParentSuite {
         let parentSuiteItem = testExplorerRoot;
         let testLabel = testName;
@@ -768,7 +1163,17 @@ export class CTestDriver implements vscode.Disposable {
                 parentSuiteItem = suiteItem;
             }
         }
-        const testItem = initializedTestExplorer.createTestItem(testName, testLabel, uri);
+        const existing = parentSuiteItem.children.get(testName);
+        let testItem: vscode.TestItem;
+        if (existing && existing.uri?.toString() === uri?.toString()) {
+            testItem = existing;
+            if (testItem.label !== testLabel) {
+                testItem.label = testLabel;
+            }
+        } else {
+            // Create or recreate testItem if the uri is stale or it does not already exist
+            testItem = initializedTestExplorer.createTestItem(testName, testLabel, uri);
+        }
         return { test: testItem, parentSuite: parentSuiteItem };
     }
 
@@ -781,13 +1186,14 @@ export class CTestDriver implements vscode.Disposable {
             log.error(localize('folder.not.found.in.test.explorer', 'Folder is not found in Test Explorer: {0}', sourceDir));
             return;
         }
-        // Clear all children and re-add later
-        testExplorerRoot.children.replace([]);
+
+        // Keep track of all currently active test ids to remove the invalid ones afterwards
+        const activeTestIDs = new Set<string>();
 
         if (!ctestArgs) {
             // Happens when testPreset is not selected
             const testItem = initializedTestExplorer.createTestItem(testPresetRequired, localize('test.preset.required', 'Select a test preset to discover tests'));
-            testExplorerRoot.children.add(testItem);
+            testExplorerRoot.children.replace([testItem]);
             return;
         }
 
@@ -795,40 +1201,15 @@ export class CTestDriver implements vscode.Disposable {
             // Legacy CTest tests
             for (const test of this.legacyTests) {
                 testExplorerRoot.children.add(initializedTestExplorer.createTestItem(test.name, test.name));
+                activeTestIDs.add(test.name);
             }
         } else if (testType === "CTestInfo" && this.tests !== undefined) {
             if (this.tests && this.tests.kind === 'ctestInfo') {
+                // Build a map from executable paths to source files using the code model
+                const executableToSources = this.buildExecutableToSourcesMap(driver.codeModelContent);
+
                 this.tests.tests.forEach(test => {
-                    let testDefFile: string | undefined;
-                    let testDefLine: number | undefined;
-
-                    // Use DEF_SOURCE_LINE CMake test property to find file and line number
-                    // Property must be set in the test's CMakeLists.txt file or its included modules for this to work
-                    const defSourceLineProperty = test.properties.filter(property => property.name === "DEF_SOURCE_LINE")[0];
-                    if (defSourceLineProperty && defSourceLineProperty.value && typeof defSourceLineProperty.value === 'string') {
-                        // Use RegEx to match the format "file_path:line" in value[0]
-                        const match = defSourceLineProperty.value.match(/(.*):(\d+)/);
-                        if (match && match[1] && match[2]) {
-                            testDefFile = match[1];
-                            testDefLine = parseInt(match[2]);
-                            if (isNaN(testDefLine)) {
-                                testDefLine = undefined;
-                                testDefFile = undefined;
-                            }
-                        }
-                    }
-
-                    const nodes = this.tests!.backtraceGraph.nodes;
-                    if (!testDefFile && test.backtrace !== undefined && nodes[test.backtrace] !== undefined) {
-                        // Use the backtrace graph to find the file and line number
-                        // This finds the CMake module's file and line number and not the test file and line number
-                        let node = nodes[test.backtrace];
-                        while (node.parent !== undefined && nodes[node.parent].command !== undefined) {
-                            node = nodes[node.parent];
-                        }
-                        testDefFile = this.tests!.backtraceGraph.files[node.file];
-                        testDefLine = node.line;
-                    }
+                    const { file: testDefFile, line: testDefLine } = this.resolveTestSourceLocation(test, executableToSources, this.tests!.backtraceGraph);
 
                     const testAndParentSuite = this.createTestItemAndSuiteTree(test.name, testExplorerRoot, initializedTestExplorer, testDefFile ? vscode.Uri.file(testDefFile) : undefined);
                     const testItem = testAndParentSuite.test;
@@ -836,6 +1217,8 @@ export class CTestDriver implements vscode.Disposable {
 
                     if (testDefLine !== undefined) {
                         testItem.range = new vscode.Range(new vscode.Position(testDefLine - 1, 0), new vscode.Position(testDefLine - 1, 0));
+                    } else {
+                        testItem.range = undefined;
                     }
 
                     const testTags: vscode.TestTag[] = [];
@@ -854,12 +1237,24 @@ export class CTestDriver implements vscode.Disposable {
                     if (testTags.length !== 0) {
                         testItem.tags = [...testItem.tags, ...testTags];
                     }
-
                     parentSuiteItem.children.add(testItem);
+                    activeTestIDs.add(testItem.id);
                 });
             };
         }
 
+        const removeDeletedTests = (collection: vscode.TestItemCollection) => {
+            collection.forEach((item: vscode.TestItem, collection: vscode.TestItemCollection) => {
+                if (item.children.size > 0) {
+                    removeDeletedTests(item.children);
+                }
+                if (item.children.size === 0 && !activeTestIDs.has(item.id)) {
+                    collection.delete(item.id);
+                }
+            });
+        };
+
+        removeDeletedTests(testExplorerRoot.children);
     }
 
     /**
@@ -947,6 +1342,72 @@ export class CTestDriver implements vscode.Disposable {
         }
 
         return undefined;
+    }
+
+    /**
+     * Returns all leaf test names for a specific project (sourceDir) from the test explorer tree.
+     * In multi-project workspaces, this ensures the superset used for regex computation
+     * contains only tests belonging to the correct project, avoiding overly broad matches.
+     */
+    private getTestNamesForSourceDir(sourceDir: string): string[] | undefined {
+        if (!testExplorer) {
+            return this.getTestNames();
+        }
+        const normalizedSourceDir = util.platformNormalizePath(sourceDir);
+        const projectRoot = testExplorer.items.get(normalizedSourceDir);
+        if (!projectRoot) {
+            return this.getTestNames();
+        }
+        const names: string[] = [];
+        const collectLeafNames = (item: vscode.TestItem) => {
+            if (item.children.size === 0) {
+                names.push(item.id);
+            } else {
+                item.children.forEach(child => collectLeafNames(child));
+            }
+        };
+        projectRoot.children.forEach(child => collectLeafNames(child));
+        return names.length > 0 ? names : this.getTestNames();
+    }
+
+    /**
+     * Returns test information suitable for the project outline view.
+     * Each entry maps a test name to its executable path and optionally
+     * the resolved source file path for click-to-navigate.
+     */
+    getTestsForOutline(codeModelContent?: CodeModelContent | null): { name: string; executablePath: string; sourceFilePath?: string; sourceFileLine?: number }[] {
+        if (this.tests) {
+            const executableToSources = codeModelContent ? this.buildExecutableToSourcesMap(codeModelContent) : undefined;
+
+            return this.tests.tests.map(test => {
+                const { file: sourceFilePath, line: sourceFileLine } = this.resolveTestSourceLocation(test, executableToSources, this.tests!.backtraceGraph);
+
+                return {
+                    name: test.name,
+                    executablePath: test.command[0],
+                    sourceFilePath,
+                    sourceFileLine
+                };
+            });
+        }
+        return [];
+    }
+
+    /**
+     * Returns the executable path, arguments, working directory, and environment for a given test name.
+     * Used by cmakeProject to auto-generate debug configurations without requiring launch.json.
+     */
+    getTestInfo(testName: string): { program: string; args: string[]; workingDirectory: string; environment: { [key: string]: string } } | undefined {
+        const program = this.testProgram(testName);
+        if (!program) {
+            return undefined;
+        }
+        return {
+            program,
+            args: this.testArgs(testName),
+            workingDirectory: this.testWorkingDirectory(testName),
+            environment: this.testEnvironment(testName)
+        };
     }
 
     clearTests(driver: CMakeDriver) {
@@ -1077,8 +1538,29 @@ export class CTestDriver implements vscode.Disposable {
             return;
         }
 
-        const requestedTests = request.include || this.testItemCollectionToArray(testExplorer.items);
-        const tests = this.uniqueTests(requestedTests);
+        // Helper to collect all leaf tests from a list of test items (suites or tests)
+        function flattenTests(items: readonly vscode.TestItem[]): vscode.TestItem[] {
+            const result: vscode.TestItem[] = [];
+            function collect(item: vscode.TestItem) {
+                if (item.children.size === 0) {
+                    result.push(item);
+                } else {
+                    item.children.forEach(collect);
+                }
+            }
+            items.forEach(collect);
+            return result;
+        }
+
+        // Expand suites in include and exclude to all their leaf tests
+        const requestedTests = request.include
+            ? flattenTests(request.include)
+            : this.testItemCollectionToArray(testExplorer.items).flatMap(item => flattenTests([item]));
+        const excludeTests = request.exclude ? flattenTests(request.exclude) : [];
+        const excludeSet = new Set(excludeTests.map(item => item.id));
+
+        const filteredRequestedTests = requestedTests.filter(test => !excludeSet.has(test.id));
+        const tests = this.uniqueTests(filteredRequestedTests);
 
         if (!await this.checkTestPreset(tests)) {
             return;
@@ -1100,7 +1582,7 @@ export class CTestDriver implements vscode.Disposable {
         run.end();
     };
 
-    private async debugCTestHelper(tests: vscode.TestItem[], run: vscode.TestRun, cancellation: vscode.CancellationToken): Promise<number> {
+    private async debugCTestHelper(tests: vscode.TestItem[], run: vscode.TestRun, cancellation: vscode.CancellationToken, useLaunchJson: boolean = true): Promise<number> {
         let returnCode: number = 0;
 
         if (!await this.checkTestPreset(tests)) {
@@ -1119,17 +1601,79 @@ export class CTestDriver implements vscode.Disposable {
                 this.ctestErrored(test, run, { message: localize('no.project.found', 'No project found for folder {0}', folder) });
                 continue;
             }
-            const workspaceFolder = project.workspaceFolder;
 
             if (test.children.size > 0) {
                 // Shouldn't reach here now, but not hard to write so keeping it in case we want to have more complicated test hierarchies
                 const children = this.testItemCollectionToArray(test.children);
-                if (await this.debugCTestHelper(children, run, cancellation)) {
+                if (await this.debugCTestHelper(children, run, cancellation, useLaunchJson)) {
                     returnCode = -1;
                 }
             } else {
                 run.started(test);
-                await this.debugCTestImpl(workspaceFolder, test.id, cancellation);
+
+                // Re-check the setting each iteration so mid-run changes are honored
+                const shouldBypassQuickPick = !useLaunchJson || this.ws.config.ctestNeverDebugTestsWithLaunchConfiguration === true;
+
+                if (!shouldBypassQuickPick) {
+                    // Determine the workspace folder for this test's project
+                    const workspaceFolder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(project.folderPath));
+
+                    // Build the unified quick pick: "Debug without launch configuration" + any launch configs
+                    const debugWithoutLaunchConfig: ConfigItem = {
+                        label: localize('debug.without.launch.config', 'Debug without launch configuration'),
+                        config: undefined as any,
+                        detail: '',
+                        picked: true
+                    };
+
+                    const launchConfigs = workspaceFolder ? this.getLaunchConfigs(workspaceFolder) : [];
+
+                    let selectedLaunchConfig: ConfigItem | undefined;
+
+                    if (launchConfigs.length === 0) {
+                        // No launch configs available — go directly to path A (debug without launch config)
+                        selectedLaunchConfig = undefined;
+                    } else {
+                        // Check if cmake.ctest.debugLaunchTarget auto-selects a config
+                        if (this.ws.config.ctestDebugLaunchTarget) {
+                            const autoSelected = launchConfigs.find(x => x.label === this.ws.config.ctestDebugLaunchTarget);
+                            if (autoSelected) {
+                                selectedLaunchConfig = autoSelected;
+                            }
+                        }
+
+                        if (!selectedLaunchConfig) {
+                            const allItems: ConfigItem[] = [debugWithoutLaunchConfig, ...launchConfigs];
+                            const chosen = await vscode.window.showQuickPick(allItems, {
+                                placeHolder: localize('choose.debug.method', 'Choose how to debug the test.')
+                            });
+                            if (!chosen) {
+                                // User cancelled — skip this test
+                                run.skipped(test);
+                                continue;
+                            }
+                            if (chosen !== debugWithoutLaunchConfig) {
+                                selectedLaunchConfig = chosen;
+                            }
+                        }
+                    }
+
+                    if (selectedLaunchConfig) {
+                        // Path B: debug with the selected launch configuration
+                        if (workspaceFolder) {
+                            await this.debugCTestImpl(workspaceFolder, test.id, cancellation, selectedLaunchConfig);
+                        }
+                    } else {
+                        // Path A: debug without launch configuration
+                        // Prompt to set the workspace setting if it hasn't been set yet (fire concurrently with debug session)
+                        this.promptNeverDebugWithLaunch();
+                        await this.debugWithoutLaunchConfig(project, test.id, cancellation);
+                    }
+                } else {
+                    // Path A: debug without launch configuration (bypassed quick pick)
+                    await this.debugWithoutLaunchConfig(project, test.id, cancellation);
+                }
+
                 // We have no way to get the result, so just mark it as skipped
                 run.skipped(test);
             }
@@ -1137,99 +1681,58 @@ export class CTestDriver implements vscode.Disposable {
         return returnCode;
     }
 
-    private async debugCTestImpl(workspaceFolder: vscode.WorkspaceFolder, testName: string, cancellation: vscode.CancellationToken): Promise<void> {
-        const magicValue = sessionNum++;
-        const launchConfig = vscode.workspace.getConfiguration(
-            'launch',
-            workspaceFolder.uri
-        );
-        const workspaceLaunchConfig = vscode.workspace.workspaceFile ? vscode.workspace.getConfiguration(
-            'launch',
-            vscode.workspace.workspaceFile
-        ) : undefined;
-        const configs = launchConfig.get<vscode.DebugConfiguration[]>('configurations') ?? [];
-        const workspaceConfigs = workspaceLaunchConfig?.get<vscode.DebugConfiguration[]>('configurations') ?? [];
-        if (configs.length === 0 && workspaceConfigs.length === 0) {
-            log.error(localize('no.launch.config', 'No launch configurations found.'));
-            return;
-        }
-
-        interface ConfigItem extends vscode.QuickPickItem {
-            label: string;
-            config: vscode.DebugConfiguration;
-            detail: string;
-            // Undefined for workspace launch config
-            folder?: vscode.WorkspaceFolder;
-        }
-        let allConfigItems: ConfigItem[] = configs.map(config => ({ label: config.name, config, folder: workspaceFolder, detail: workspaceFolder.uri.fsPath }));
-        allConfigItems = allConfigItems.concat(workspaceConfigs.map(config => ({ label: config.name, config, detail: vscode.workspace.workspaceFile!.fsPath })));
-        let chosenConfig: ConfigItem | undefined;
-        if (allConfigItems.length === 1) {
-            chosenConfig = allConfigItems[0];
-        }
-        if (!chosenConfig && this.ws.config.ctestDebugLaunchTarget) {
-            chosenConfig = allConfigItems.find(x => x.label === this.ws.config.ctestDebugLaunchTarget);
-        }
-
-        if (!chosenConfig) {
-            // TODO: we can remember the last choice once the CMake side panel work is done
-            const chosen = await vscode.window.showQuickPick(allConfigItems, { placeHolder: localize('choose.launch.config', 'Choose a launch configuration to debug the test with.') });
-            if (chosen) {
-                chosenConfig = chosen;
-            } else {
-                return;
-            }
-        }
-
-        // Commands can't be used to replace array (i.e., args); and both test program and test args requires folder and
-        // test name as parameters, which means one lauch config for each test. So replacing them here is a better way.
-        chosenConfig.config = this.replaceAllInObject<vscode.DebugConfiguration>(chosenConfig.config, '${cmake.testProgram}', this.testProgram(testName));
-        chosenConfig.config = this.replaceAllInObject<vscode.DebugConfiguration>(chosenConfig.config, '${cmake.testWorkingDirectory}', this.testWorkingDirectory(testName));
-
-        // Replace cmake.testArgs wrapped in quotes, like `"${command:cmake.testArgs}"`, without any spaces in between,
-        // since we need to repalce the quotes as well.
-        chosenConfig.config = this.replaceArrayItems(chosenConfig.config, '${cmake.testArgs}', this.testArgs(testName)) as vscode.DebugConfiguration;
-
-        // Identify the session we started
-        chosenConfig.config[magicKey] = magicValue;
-        let onDidStartDebugSession: vscode.Disposable | undefined;
-        let onDidTerminateDebugSession: vscode.Disposable | undefined;
-        let sessionId: string | undefined;
-        const started = new Promise<vscode.DebugSession>(resolve => {
-            onDidStartDebugSession = vscode.debug.onDidStartDebugSession((session: vscode.DebugSession) => {
-                if (session.configuration[magicKey] === magicValue) {
-                    sessionId = session.id;
-                    resolve(session);
-                }
-            });
-        });
-
-        const terminated = new Promise<void>(resolve => {
-            onDidTerminateDebugSession = vscode.debug.onDidTerminateDebugSession((session: vscode.DebugSession) => {
-                if (session.id === sessionId) {
-                    resolve();
-                }
-            });
-        }).finally(() => {
-            log.info('debugSessionTerminated');
-        });
-
-        const debugStarted = await vscode.debug.startDebugging(chosenConfig.folder, chosenConfig.config!);
-        if (debugStarted) {
-            const session = await started;
-            if (session) {
+    private async debugWithoutLaunchConfig(project: CMakeProject, testId: string, cancellation: vscode.CancellationToken): Promise<void> {
+        const session = await project.debugCTest(testId);
+        if (session) {
+            await new Promise<void>(resolve => {
+                const disposable = vscode.debug.onDidTerminateDebugSession((s: vscode.DebugSession) => {
+                    if (s.id === session.id) {
+                        disposable.dispose();
+                        resolve();
+                    }
+                });
                 cancellation.onCancellationRequested(() => {
                     void vscode.debug.stopDebugging(session);
                 });
-            }
-            await terminated;
-            if (onDidStartDebugSession) {
-                onDidStartDebugSession.dispose();
-            }
-            if (onDidTerminateDebugSession) {
-                onDidTerminateDebugSession.dispose();
-            }
+            });
         }
+    }
+
+    private promptNeverDebugWithLaunch(): void {
+        // Key by workspace identity: .code-workspace file for multi-root, or first folder for single-folder
+        const workspaceKey = vscode.workspace.workspaceFile?.toString()
+            ?? vscode.workspace.workspaceFolders?.[0]?.uri.toString()
+            ?? '';
+
+        // Only prompt if we haven't prompted for this workspace this session
+        if (promptedNeverDebugWithLaunchWorkspaces.has(workspaceKey)) {
+            return;
+        }
+
+        const inspection = vscode.workspace.getConfiguration('cmake.ctest', this.ws.folder?.uri).inspect<boolean>('neverDebugTestsWithLaunchConfiguration');
+        const workspaceValue = inspection?.workspaceValue ?? inspection?.workspaceFolderValue;
+
+        if (workspaceValue !== undefined) {
+            // Already explicitly set in workspace — don't prompt
+            return;
+        }
+
+        promptedNeverDebugWithLaunchWorkspaces.add(workspaceKey);
+
+        const yes = localize('yes', 'Yes');
+        const no = localize('no', 'No');
+        void vscode.window.showInformationMessage(
+            localize('never.debug.with.launch.prompt', 'Would you like to always debug tests without a launch configuration in this workspace?'),
+            yes,
+            no
+        ).then(async (choice) => {
+            if (choice === yes) {
+                await vscode.workspace.getConfiguration('cmake.ctest', this.ws.folder?.uri).update('neverDebugTestsWithLaunchConfiguration', true, vscode.ConfigurationTarget.WorkspaceFolder);
+            } else if (choice === no) {
+                await vscode.workspace.getConfiguration('cmake.ctest', this.ws.folder?.uri).update('neverDebugTestsWithLaunchConfiguration', false, vscode.ConfigurationTarget.WorkspaceFolder);
+            }
+            // If dismissed, leave as null — don't prompt again this session
+        });
     }
 
     private testProgram(testName: string): string {
@@ -1269,6 +1772,30 @@ export class CTestDriver implements vscode.Disposable {
             }
         }
         return [];
+    }
+
+    /**
+     * Returns the ENVIRONMENT property from the CTest test properties for the given test.
+     * CTest stores environment as `["KEY=VALUE", ...]`; this returns `{ KEY: "VALUE", ... }`.
+     */
+    private testEnvironment(testName: string): { [key: string]: string } {
+        const env: { [key: string]: string } = {};
+        const property = this.tests?.tests
+            .find(test => test.name === testName)?.properties
+            .find(prop => prop.name === 'ENVIRONMENT');
+
+        if (property) {
+            const entries = Array.isArray(property.value) ? property.value : [property.value];
+            for (const entry of entries) {
+                const eqIndex = entry.indexOf('=');
+                if (eqIndex !== -1) {
+                    const name = entry.substring(0, eqIndex);
+                    const value = entry.substring(eqIndex + 1);
+                    env[name] = value;
+                }
+            }
+        }
+        return env;
     }
 
     private replaceAllInObject<T>(obj: any, str: string, replace: string): T {
@@ -1322,7 +1849,136 @@ export class CTestDriver implements vscode.Disposable {
         return orig;
     }
 
-    private async debugTestHandler(request: vscode.TestRunRequest, cancellation: vscode.CancellationToken) {
+    /**
+     * Recursively replaces a string value that exactly matches `str` with an arbitrary replacement value.
+     * Used for replacing placeholders like `${cmake.testEnvironment}` with an array of objects.
+     */
+    private replaceValueInObject<T>(obj: any, str: string, replace: any): T {
+        if (util.isString(obj) && obj === str) {
+            return replace;
+        } else if (util.isArray(obj)) {
+            for (let i = 0; i < obj.length; i++) {
+                obj[i] = this.replaceValueInObject(obj[i], str, replace);
+            }
+        } else if (typeof obj === 'object' && obj !== null) {
+            for (const key of Object.keys(obj)) {
+                obj[key] = this.replaceValueInObject(obj[key], str, replace);
+            }
+        }
+        return obj;
+    }
+
+    private getLaunchConfigs(workspaceFolder: vscode.WorkspaceFolder): ConfigItem[] {
+        // Use inspect() to read configs from each scope separately, avoiding the
+        // duplicates that get() produces when it merges all scopes together.
+        const launchConfig = vscode.workspace.getConfiguration('launch', workspaceFolder.uri);
+        const inspected = launchConfig.inspect<vscode.DebugConfiguration[]>('configurations');
+
+        let allConfigItems: ConfigItem[] = [];
+
+        // Folder-level configs (from .vscode/launch.json)
+        if (inspected?.workspaceFolderValue) {
+            allConfigItems = inspected.workspaceFolderValue.map(config => ({
+                label: config.name, config, folder: workspaceFolder, detail: workspaceFolder.uri.fsPath
+            }));
+        }
+
+        // Workspace-level configs (from .code-workspace file)
+        if (inspected?.workspaceValue && vscode.workspace.workspaceFile) {
+            allConfigItems = allConfigItems.concat(inspected.workspaceValue.map(config => ({
+                label: config.name, config, detail: vscode.workspace.workspaceFile!.fsPath
+            })));
+        }
+
+        return allConfigItems;
+    }
+
+    private async debugCTestImpl(workspaceFolder: vscode.WorkspaceFolder, testName: string, cancellation: vscode.CancellationToken, preSelectedConfig?: ConfigItem): Promise<void> {
+        const magicValue = sessionNum++;
+        let chosenConfig: ConfigItem | undefined = preSelectedConfig;
+
+        if (!chosenConfig) {
+            const allConfigItems = this.getLaunchConfigs(workspaceFolder);
+            if (allConfigItems.length === 0) {
+                log.error(localize('no.launch.config', 'No launch configurations found.'));
+                return;
+            }
+
+            if (allConfigItems.length === 1) {
+                chosenConfig = allConfigItems[0];
+            }
+            if (!chosenConfig && this.ws.config.ctestDebugLaunchTarget) {
+                chosenConfig = allConfigItems.find(x => x.label === this.ws.config.ctestDebugLaunchTarget);
+            }
+
+            if (!chosenConfig) {
+                // TODO: we can remember the last choice once the CMake side panel work is done
+                const chosen = await vscode.window.showQuickPick(allConfigItems, { placeHolder: localize('choose.launch.config', 'Choose a launch configuration to debug the test with.') });
+                if (chosen) {
+                    chosenConfig = chosen;
+                } else {
+                    return;
+                }
+            }
+        }
+
+        // Commands can't be used to replace array (i.e., args); and both test program and test args requires folder and
+        // test name as parameters, which means one launch config for each test. So replacing them here is a better way.
+        chosenConfig.config = this.replaceAllInObject<vscode.DebugConfiguration>(chosenConfig.config, '${cmake.testProgram}', this.testProgram(testName));
+        chosenConfig.config = this.replaceAllInObject<vscode.DebugConfiguration>(chosenConfig.config, '${cmake.testWorkingDirectory}', this.testWorkingDirectory(testName));
+
+        // Replace cmake.testArgs wrapped in quotes, like `"${command:cmake.testArgs}"`, without any spaces in between,
+        // since we need to replace the quotes as well.
+        chosenConfig.config = this.replaceArrayItems(chosenConfig.config, '${cmake.testArgs}', this.testArgs(testName)) as vscode.DebugConfiguration;
+
+        // Replace cmake.testEnvironment with the test's ENVIRONMENT property as an array of { name, value } objects.
+        const testEnv = this.testEnvironment(testName);
+        const testEnvArray = Object.entries(testEnv).map(([name, value]) => ({ name, value }));
+        chosenConfig.config = this.replaceValueInObject<vscode.DebugConfiguration>(chosenConfig.config, '${cmake.testEnvironment}', testEnvArray);
+
+        // Identify the session we started
+        chosenConfig.config[magicKey] = magicValue;
+        let onDidStartDebugSession: vscode.Disposable | undefined;
+        let onDidTerminateDebugSession: vscode.Disposable | undefined;
+        let sessionId: string | undefined;
+        const started = new Promise<vscode.DebugSession>(resolve => {
+            onDidStartDebugSession = vscode.debug.onDidStartDebugSession((session: vscode.DebugSession) => {
+                if (session.configuration[magicKey] === magicValue) {
+                    sessionId = session.id;
+                    resolve(session);
+                }
+            });
+        });
+
+        const terminated = new Promise<void>(resolve => {
+            onDidTerminateDebugSession = vscode.debug.onDidTerminateDebugSession((session: vscode.DebugSession) => {
+                if (session.id === sessionId) {
+                    resolve();
+                }
+            });
+        }).finally(() => {
+            log.info('debugSessionTerminated');
+        });
+
+        const debugStarted = await vscode.debug.startDebugging(chosenConfig.folder, chosenConfig.config!);
+        if (debugStarted) {
+            const session = await started;
+            if (session) {
+                cancellation.onCancellationRequested(() => {
+                    void vscode.debug.stopDebugging(session);
+                });
+            }
+            await terminated;
+            if (onDidStartDebugSession) {
+                onDidStartDebugSession.dispose();
+            }
+            if (onDidTerminateDebugSession) {
+                onDidTerminateDebugSession.dispose();
+            }
+        }
+    }
+
+    private async debugTestHandler(request: vscode.TestRunRequest, cancellation: vscode.CancellationToken, useLaunchJson: boolean = true) {
         // NOTE: We expect the testExplorer to be undefined when the cmake.ctest.testExplorerIntegrationEnabled is disabled.
         if (!testExplorer) {
             return;
@@ -1335,7 +1991,7 @@ export class CTestDriver implements vscode.Disposable {
         this.ctestsEnqueued(tests, run);
         const buildSucceeded = await this.buildTests(tests, run);
         if (buildSucceeded) {
-            await this.debugCTestHelper(tests, run, cancellation);
+            await this.debugCTestHelper(tests, run, cancellation, useLaunchJson);
         } else {
             log.info(localize('test.skip.debug.build.failure', "Not debugging tests due to build failure."));
         }
@@ -1350,44 +2006,120 @@ export class CTestDriver implements vscode.Disposable {
         return currentTestItem.id;
     }
 
+    /**
+     * Determine and build all targets needed to rebuild the selected TestItems. Returns a false if anything goes
+     * wrong, and returns an early success if build-before-run is disabled.
+     */
     private async buildTests(tests: vscode.TestItem[], run: vscode.TestRun): Promise<boolean> {
         // If buildBeforeRun is set to false, we skip the build step
         if (!this.ws.config.buildBeforeRun) {
             return true;
         }
 
-        // Folder => status
-        const builtFolder = new Map<string, number>();
-        let status: number = 0;
+        const foundTarget = new Map<CMakeProject, Map<string, vscode.TestItem[]>>();
         for (const test of tests) {
-            const folder = this.getTestRootFolder(test);
-            if (!builtFolder.has(folder)) {
-                const project = await this.projectController?.getProjectForFolder(folder);
-                if (!project) {
-                    status = 1;
-                } else {
-                    try {
-                        if (extensionManager !== undefined && extensionManager !== null) {
-                            extensionManager.cleanOutputChannel();
-                        }
-                        const buildResult = await project.build(undefined, false, false);
-                        if (buildResult.exitCode !== 0) {
-                            status = 2;
-                        }
-                    } catch (e) {
-                        status = 2;
-                    }
-                }
-            }
-            builtFolder.set(folder, status);
-            if (status === 1) {
-                this.ctestErrored(test, run, { message: localize('no.project.found', 'No project found for folder {0}', folder) });
-            } else if (status === 2) {
-                this.ctestErrored(test, run, { message: localize('build.failed', 'Build failed') });
+            if (!await this.getTestTargets(test, foundTarget, run)) {
+                return false;
             }
         }
 
-        return Array.from(builtFolder.values()).filter(v => v !== 0).length === 0;
+        return this.buildTestTargets(foundTarget, run);
+    }
+
+    /**
+     * Given the TestItem, determine the owning CMakeProject and build targets to build the tests. If the given
+     * TestItem is a suite, then recurse. Information is passed back through the foundTarget parameter. A failure to
+     * identify the project of the test will result in a ctest error and a false value being returned.
+     */
+    private async getTestTargets(test: vscode.TestItem, foundTarget: Map<CMakeProject, Map<string, vscode.TestItem[]>>, run: vscode.TestRun): Promise<boolean> {
+        if (test.children.size > 0) {
+            const children = this.testItemCollectionToArray(test.children);
+            for (const child of children) {
+                if (!await this.getTestTargets(child, foundTarget, run)) {
+                    return false;
+                }
+            }
+        } else {
+            const testProgram = this.testProgram(test.id);
+            if (!testProgram) {
+                this.ctestErrored(test, run, { message: localize('test.program.not.found', 'Could not determine the test program for test {0}', test.id) });
+                return false;
+            }
+            const folder = this.getTestRootFolder(test);
+            const project = await this.projectController?.getProjectForFolder(folder);
+            if (!project) {
+                this.ctestErrored(test, run, { message: localize('no.project.found', 'No project found for folder {0}', folder) });
+                return false;
+            }
+            if (!foundTarget.has(project)) {
+                foundTarget.set(project, new Map<string, vscode.TestItem[]>([[testProgram, [test]]]));
+            } else {
+                const prj = foundTarget.get(project)!;
+                if (!prj.has(testProgram)) {
+                    prj.set(testProgram, [test]);
+                } else {
+                    prj.get(testProgram)!.push(test);
+                }
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Build the targets provided in foundTarget. CMake will be invoked once per CMakeProject for efficiency. On error,
+     * the associated tests will be flagged with a ctest error and a false value will be returned.
+     */
+    private async buildTestTargets(foundTarget: Map<CMakeProject, Map<string, vscode.TestItem[]>>, run: vscode.TestRun): Promise<boolean> {
+        let overallSuccess = true;
+        for (const [project, targets] of foundTarget) {
+            const execTargets = await project.executableTargets;
+            // Precompute a lookup map from normalized executable path to target name, excluding install targets
+            const execPathToName = new Map<string, string>();
+            for (const t of execTargets) {
+                if (!t.isInstallTarget) {
+                    execPathToName.set(util.platformNormalizePath(t.path), t.name);
+                }
+            }
+            const accumulatedTestList: vscode.TestItem[] = [];
+            const accumulatedTargets: string[] = [];
+            let success: boolean = true;
+            for (const [targetPath, testList] of targets) {
+                const normalizedTargetPath = util.platformNormalizePath(targetPath);
+                const targetName = execPathToName.get(normalizedTargetPath);
+                if (targetName) {
+                    accumulatedTargets.push(targetName);
+                } else {
+                    // Test command is not a known CMake executable target (e.g. python, mpiexec, cmake -E).
+                    // Skip it from the targeted build list — it doesn't need to be built by CMake.
+                    log.info(localize('test.target.not.resolved', 'Test program \'{0}\' is not a known CMake executable target; skipping from build.', targetPath));
+                }
+                accumulatedTestList.push(...testList);
+            }
+            if (accumulatedTargets.length === 0) {
+                // No CMake targets to build — all tests use non-CMake commands.
+                continue;
+            }
+            try {
+                if (extensionManager !== undefined && extensionManager !== null) {
+                    extensionManager.cleanOutputChannel();
+                }
+                const buildResult = await project.build(accumulatedTargets, false, false);
+                if (buildResult.exitCode !== 0) {
+                    log.error(localize('build.targets.failed.with.code', 'Building targets [{0}] failed with exit code {1}.', accumulatedTargets.join(', '), buildResult.exitCode));
+                    success = false;
+                }
+            } catch (e) {
+                log.error(localize('build.targets.threw', 'Building targets [{0}] threw an error: {1}', accumulatedTargets.join(', '), (e as Error)?.message ?? String(e)));
+                success = false;
+            }
+            if (!success) {
+                overallSuccess = false;
+                accumulatedTestList.forEach(test => {
+                    this.ctestErrored(test, run, { message: localize('build.failed', 'Build failed') });
+                });
+            }
+        };
+        return overallSuccess;
     }
 
     /**
@@ -1407,7 +2139,6 @@ export class CTestDriver implements vscode.Disposable {
                     const folderPath = util.platformNormalizePath(project.sourceDir);
                     const folderName = path.basename(project.sourceDir);
                     const testItem = testExplorer.createTestItem(folderPath, folderName);
-                    testItem.description = folderPath;
                     testExplorer.items.add(testItem);
                 }
             }
@@ -1429,7 +2160,7 @@ export class CTestDriver implements vscode.Disposable {
                 vscode.TestRunProfileKind.Debug,
                 (request: vscode.TestRunRequest, cancellation: vscode.CancellationToken) => {
                     if (request.include === undefined) {
-                        return this.debugTestHandler(request, cancellation);
+                        return this.debugTestHandler(request, cancellation, true);
                     }
 
                     // Try to find the specific test controller, if we hit any errors, fall back to the default test handler.
@@ -1438,12 +2169,14 @@ export class CTestDriver implements vscode.Disposable {
                         const testProject = this.projectController!.getAllCMakeProjects().filter(
                             project => request.include![0].uri!.fsPath.includes(project.folderPath)
                         );
-                        return testProject![0].cTestController.debugTestHandler(request, cancellation);
+                        return testProject![0].cTestController.debugTestHandler(request, cancellation, true);
                     } catch (e) {
-                        return this.debugTestHandler(request, cancellation);
+                        return this.debugTestHandler(request, cancellation, true);
                     }
-                }
+                },
+                true
             );
+
         }
         return testExplorer;
     }

@@ -122,7 +122,10 @@ export class CMakeFileApiDriver extends CMakeDriver {
         // We need to treat this case as if the cache is not present and let a reconfigure
         // refresh the cache information.
         const cacheExists: boolean = await fs.exists(this.cachePath);
-        if (cacheExists && this.generator?.name === await this.getGeneratorFromCache(this.cachePath)) {
+        // When this.generator is null (e.g., __unspec__ kit with CMake >= 3.15 where CMake picks
+        // the default generator), treat it as "no explicit preference" and trust the existing cache
+        // rather than interpreting it as a generator mismatch that requires a clean reconfigure.
+        if (cacheExists && (this.generator === null || this.generator.name === await this.getGeneratorFromCache(this.cachePath))) {
             await this.loadGeneratorInformationFromCache(this.cachePath);
             const code_model_exist = await this.updateCodeModel();
             if (!code_model_exist && this.config.configureOnOpen) {
@@ -306,8 +309,6 @@ export class CMakeFileApiDriver extends CMakeDriver {
 
             const result = await child.result;
             this.configureProcess = null;
-            log.trace(result.stderr);
-            log.trace(result.stdout);
             if (result.retc === 0) {
                 if (!configurePreset || (configurePreset && defaultConfigurePresetName && configurePreset.name === defaultConfigurePresetName)) {
                     this._needsReconfigure = false;
@@ -398,7 +399,13 @@ export class CMakeFileApiDriver extends CMakeDriver {
         return this._generatorInformation ? this._generatorInformation.name : null;
     }
     get targets(): Target[] {
-        const targets = this._target_map.get(this.currentBuildType);
+        let targets = this._target_map.get(this.currentBuildType);
+        // For single-config generators (e.g. Ninja), when CMAKE_BUILD_TYPE is not set in
+        // the preset or is changed in CMakeLists.txt, the codemodel configuration name may
+        // not match currentBuildType. Fall back to the only available configuration.
+        if (!targets && this._target_map.size === 1) {
+            targets = this._target_map.values().next().value;
+        }
         if (targets) {
             const metaTargets = [{
                 type: 'rich' as 'rich',
@@ -424,7 +431,8 @@ export class CMakeFileApiDriver extends CMakeDriver {
         const executableTargetsWithInstall = uniqueExecTargets.map(t => ({
             name: t.name,
             path: (t as RichTarget).filepath,
-            isInstallTarget: false
+            isInstallTarget: false,
+            debuggerWorkingDirectory: (t as RichTarget).debuggerWorkingDirectory
         }));
 
         const installLoc = localize("cmake.install.name", "Install");
@@ -436,7 +444,8 @@ export class CMakeFileApiDriver extends CMakeDriver {
                     executableTargetsWithInstall.push({
                         name: `${target.name} (${installLoc}${includePath ? ` - ${installPath.subPath}` : ''})`,
                         path: installPath.path,
-                        isInstallTarget: true
+                        isInstallTarget: true,
+                        debuggerWorkingDirectory: target.debuggerWorkingDirectory
                     });
                 }
             }

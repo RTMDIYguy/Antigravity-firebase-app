@@ -3,6 +3,7 @@ import * as nls from 'vscode-nls';
 import * as path from 'path';
 import * as vscode from "vscode";
 import * as lodash from "lodash";
+import * as api from 'vscode-cmake-tools';
 
 import * as util from '@cmt/util';
 import * as logging from '@cmt/logging';
@@ -34,27 +35,16 @@ export interface PresetsFile {
 
 export type VendorType = { [key: string]: any };
 
-export interface Preset {
-    name: string;
-    displayName?: string;
-    description?: string;
-    hidden?: boolean;
-    inherits?: string | string[];
-    environment?: EnvironmentWithNull;
-    vendor?: VendorType;
-    condition?: Condition | boolean | null;
-    isUserPreset?: boolean;
-
+export interface PresetPrivate {
     __parentEnvironment?: EnvironmentWithNull; // Private field that contains the parent environment, which might be a modified VS Dev Env, or simply process.env.
     __expanded?: boolean; // Private field to indicate if we have already expanded this preset.
     __inheritedPresetCondition?: boolean; // Private field to indicate the fully evaluated inherited preset condition.
     __file?: PresetsFile; // Private field to indicate the file where this preset was defined.
 }
+export interface Preset extends api.Preset, PresetPrivate {}
 
-export interface ValueStrategy {
-    value?: string;
-    strategy?: 'set' | 'external';
-}
+export type ValueStrategy = api.ValueStrategy;
+export type CacheVarType = api.CacheVarType;
 
 export interface WarningOptions {
     dev?: boolean;
@@ -84,13 +74,6 @@ enum TraceMode {
 enum FormatMode {
     Human = "human",
     Json = "json-v1"
-}
-
-export interface TraceOptions {
-    mode?: string;
-    format?: string;
-    source?: string[];
-    redirect: string;
 }
 
 export interface Condition {
@@ -235,8 +218,6 @@ export function evaluatePresetCondition(preset: Preset, allPresets: Preset[], re
     return undefined;
 }
 
-export type CacheVarType = null | boolean | string | { type: string; value: boolean | string };
-
 export type OsName = "Windows" | "Linux" | "macOS";
 
 export type VendorVsSettings = {
@@ -247,45 +228,19 @@ export type VendorVsSettings = {
     [key: string]: any;
 };
 
-export interface ConfigurePreset extends Preset {
-    generator?: string;
-    architecture?: string | ValueStrategy;
-    toolset?: string | ValueStrategy;
-    binaryDir?: string;
-    cmakeExecutable?: string;
-    // Make the cache value to be possibly undefined for type checking
-    cacheVariables?: { [key: string]: CacheVarType | undefined };
-    warnings?: WarningOptions;
-    errors?: ErrorOptions;
-    debug?: DebugOptions;
-    trace?: TraceOptions;
-    vendor?: VendorVsSettings | VendorType;
-    toolchainFile?: string;
-    installDir?: string;
-    graphviz?: string;
-
+export interface ConfigurePreset extends PresetPrivate, api.ConfigurePreset {
     // Private fields
     __developerEnvironmentArchitecture?: string; // Private field to indicate which VS Dev Env architecture we're using, if VS Dev Env is used.
 }
 
-export interface InheritsConfigurePreset extends Preset {
-    configurePreset?: string;
-    inheritConfigureEnvironment?: boolean; // Defaults to true
-}
+export interface InheritsConfigurePreset extends api.InheritsConfigurePreset, PresetPrivate {}
 
-export interface BuildPreset extends InheritsConfigurePreset {
-    jobs?: number;
-    targets?: string | string[];
-    configuration?: string;
-    cleanFirst?: boolean;
-    verbose?: boolean;
-    nativeToolOptions?: string[];
-
-    // Private fields
+export interface BuildPresetPrivate {
     __binaryDir?: string; // Getting this from the config preset
     __generator?: string; // Getting this from the config preset
     __targets?: string | string[]; // This field is translated to build args, so we can overwrite the target arguments.
 }
+export interface BuildPreset extends api.BuildPreset, BuildPresetPrivate, PresetPrivate {}
 
 /**
  * Should NOT cache anything. Need to make a copy if any fields need to be changed.
@@ -296,86 +251,18 @@ export const defaultBuildPreset: BuildPreset = {
     description: localize('default.build.preset.description', 'An empty build preset that does not add any arguments')
 };
 
-export interface OutputOptions {
-    shortProgress?: boolean;
-    verbosity?: 'default' | 'verbose' | 'extra';
-    debug?: boolean;
-    outputOnFailure?: boolean;
-    quiet?: boolean;
-    outputLogFile?: string;
-    outputJUnitFile?: string;
-    labelSummary?: boolean;
-    subprojectSummary?: boolean;
-    maxPassedTestOutputSize?: number;
-    maxFailedTestOutputSize?: number;
-    testOutputTruncation?: 'tail' | 'heads' | 'middle';
-    maxTestNameWidth?: number;
-}
-
-export interface IncludeFilter {
-    name?: string;
-    label?: string;
-    useUnion?: boolean;
-    index?: string | { start?: number; end?: number; stride?: number; specificTests?: number[] };
-}
-
-export interface ExcludeFilter {
-    name?: string;
-    label?: string;
-    fixtures?: { any?: string; setup?: string; cleanup?: string };
-}
-
-export interface TestFilter {
-    include?: IncludeFilter;
-    exclude?: ExcludeFilter;
-}
-
-export interface ExecutionOptions {
-    stopOnFailure?: boolean;
-    enableFailover?: boolean;
-    jobs?: number;
-    resourceSpecFile?: string;
-    testLoad?: number;
-    showOnly?: 'human' | 'json-v1';
-    repeat?: { mode: 'until-fail' | 'until-pass' | 'after-timeout'; count: number };
-    interactiveDebugging?: boolean;
-    scheduleRandom?: boolean;
-    timeout?: number;
-    noTestsAction?: 'default' | 'error' | 'ignore';
-}
-
-export interface TestPreset extends InheritsConfigurePreset {
-    configuration?: string;
-    overwriteConfigurationFile?: string[];
-    output?: OutputOptions;
-    filter?: TestFilter;
-    execution?: ExecutionOptions;
-
-    // Private fields
+export interface TestPresetPrivate {
     __binaryDir?: string; // Getting this from the config preset
     __generator?: string; // Getting this from the config preset
 }
 
-export interface PackageOutputOptions {
-    debug?: boolean;
-    verbose?: boolean;
-}
+export interface TestPreset extends api.TestPreset, TestPresetPrivate, PresetPrivate {}
 
-export interface PackagePreset extends InheritsConfigurePreset {
-    configurations?: string[];
-    generators?: string[];
-    variables?: { [key: string]: string | null | undefined };
-    configFile?: string;
-    output?: PackageOutputOptions;
-    packageName?: string;
-    packageVersion?: string;
-    packageDirectory?: string;
-    vendorName?: string;
-
-    // Private fields
+export interface PackagePresetPrivate {
     __binaryDir?: string; // Getting this from the config preset
     __generator?: string; // Getting this from the config preset
 }
+export interface PackagePreset extends api.PackagePreset, PackagePresetPrivate, PresetPrivate {}
 
 export interface WorkflowStepsOptions {
     type: string;
@@ -974,6 +861,11 @@ export interface VsDevEnvOptions {
     compilerName?: string; // Only will have a value when `useVsDeveloperEnvironmentMode` is "auto"
 }
 
+export interface VsDevEnvAutoDetectionInfo {
+    compilerName?: string;
+    generatorIsNinja: boolean;
+}
+
 /**
  * @param opts Options to control the behavior of obtaining the VS developer environment.
  * @returns Either the VS developer environment or undefined if it could not be obtained.
@@ -1074,6 +966,23 @@ async function getVsDevEnv(opts: VsDevEnvOptions): Promise<EnvironmentWithNull |
     }
 }
 
+export function getVsDevEnvAutoDetectionInfo(preset: ConfigurePreset): VsDevEnvAutoDetectionInfo {
+    const cxxCompilerValue = getStringValueFromCacheVar(preset.cacheVariables?.['CMAKE_CXX_COMPILER']);
+    const cCompilerValue = getStringValueFromCacheVar(preset.cacheVariables?.['CMAKE_C_COMPILER']);
+    const cxxCompiler = cxxCompilerValue?.toLowerCase();
+    const cCompiler = cCompilerValue?.toLowerCase();
+    const explicitCompilerName = util.isSupportedCompiler(cxxCompiler) || util.isSupportedCompiler(cCompiler);
+    const hasExplicitCompiler = cxxCompilerValue !== null || cCompilerValue !== null;
+    const generatorIsNinja = preset.generator?.toLowerCase().includes("ninja") ?? false;
+
+    return {
+        // For a Ninja preset with no explicit compiler, probe for cl so auto mode can
+        // bootstrap the VS developer environment on Windows.
+        compilerName: explicitCompilerName || (!hasExplicitCompiler && generatorIsNinja ? 'cl' : undefined),
+        generatorIsNinja
+    };
+}
+
 /**
  * This method tries to apply, based on the useVsDeveloperEnvironment setting value and, in "auto" mode, whether certain preset compilers/generators are used and not found, the VS Dev Env.
  * @param preset Preset to modify the parentEnvironment of. If the developer environment should be applied, the preset.environment is modified by reference.
@@ -1092,12 +1001,8 @@ export async function tryApplyVsDevEnv(preset: ConfigurePreset, workspaceFolder:
     // [Windows Only] We only support VS Dev Env on Windows.
     if (!preset.__parentEnvironment && process.platform === "win32") {
         if (useVsDeveloperEnvironmentMode === "auto") {
-            if (preset.cacheVariables) {
-                const cxxCompiler = getStringValueFromCacheVar(preset.cacheVariables['CMAKE_CXX_COMPILER'])?.toLowerCase();
-                const cCompiler = getStringValueFromCacheVar(preset.cacheVariables['CMAKE_C_COMPILER'])?.toLowerCase();
-                // The env variables for the supported compilers are the same.
-                const compilerName: string | undefined = util.isSupportedCompiler(cxxCompiler) || util.isSupportedCompiler(cCompiler);
-
+            const { compilerName, generatorIsNinja } = getVsDevEnvAutoDetectionInfo(preset);
+            if (compilerName || generatorIsNinja) {
                 // find where.exe using process.env since we're on windows.
                 let whereExecutable;
                 // assume in this call that it exists
@@ -1117,7 +1022,7 @@ export async function tryApplyVsDevEnv(preset: ConfigurePreset, workspaceFolder:
                     }
                 }
 
-                if (compilerName && whereExecutable) {
+                if (whereExecutable) {
                     // We need to construct and temporarily expand the environment in order to accurately determine if this preset has the compiler / ninja on PATH.
                     // This puts the preset.environment on top of process.env, then expands with process.env as the penv and preset.environment as the envOverride
                     const env = EnvironmentUtils.mergePreserveNull([process.env, preset.environment]);
@@ -1132,25 +1037,24 @@ export async function tryApplyVsDevEnv(preset: ConfigurePreset, workspaceFolder:
                         }
                     }
 
-                    const compilerLocation = await execute(whereExecutable, [compilerName], null, {
+                    const compilerLocation = compilerName ? await execute(whereExecutable, [compilerName], null, {
                         environment: EnvironmentUtils.create(presetEnv),
                         silent: true,
                         encoding: 'utf8',
                         shell: true
-                    }).result;
+                    }).result : undefined;
 
                     // if ninja isn't on path, try to look for it in a VS install
-                    const ninjaLoc = await execute(whereExecutable, ['ninja'], null, {
+                    const ninjaLoc = generatorIsNinja ? await execute(whereExecutable, ['ninja'], null, {
                         environment: EnvironmentUtils.create(presetEnv),
                         silent: true,
                         encoding: 'utf8',
                         shell: true
-                    }).result;
+                    }).result : undefined;
 
-                    const generatorIsNinja = preset.generator?.toLowerCase().includes("ninja");
-                    const shouldInterrogateForNinja = (generatorIsNinja ?? false) && !ninjaLoc.stdout;
+                    const shouldInterrogateForNinja = generatorIsNinja && !ninjaLoc?.stdout;
 
-                    if (!compilerLocation.stdout || shouldInterrogateForNinja) {
+                    if ((compilerName && !compilerLocation?.stdout) || shouldInterrogateForNinja) {
                         developerEnvironment = await getVsDevEnv({
                             preset,
                             shouldInterrogateForNinja,
@@ -1357,6 +1261,10 @@ export async function expandConfigurePresetVariables(preset: ConfigurePreset, fo
     if (preset.cacheVariables) {
         expandedPreset.cacheVariables = {};
         for (const cacheVarName in preset.cacheVariables) {
+            // Skip $comment keys as they are only for documentation purposes
+            if (cacheVarName === '$comment') {
+                continue;
+            }
             const cacheVar = preset.cacheVariables[cacheVarName];
             if (typeof cacheVar === 'boolean') {
                 expandedPreset.cacheVariables[cacheVarName] = cacheVar;
@@ -2009,9 +1917,12 @@ async function getPackagePresetInheritsHelper(folder: string, preset: PackagePre
 
     refs.add(preset.name);
 
-    // Init env to empty if not specified to avoid null checks later
+    // Init env and variables to empty if not specified to avoid null checks later
     if (!preset.environment) {
         preset.environment = EnvironmentUtils.createPreserveNull();
+    }
+    if (!preset.variables) {
+        preset.variables = {};
     }
     let inheritedEnv = EnvironmentUtils.createPreserveNull();
     let inheritedParentEnv = EnvironmentUtils.createPreserveNull();
@@ -2027,6 +1938,14 @@ async function getPackagePresetInheritsHelper(folder: string, preset: PackagePre
                 // Inherit environment
                 inheritedEnv = EnvironmentUtils.mergePreserveNull([parent.environment, inheritedEnv]);
                 inheritedParentEnv = EnvironmentUtils.mergePreserveNull([parent.__parentEnvironment, inheritedParentEnv]);
+                // Inherit variables
+                if (parent.variables) {
+                    for (const name in parent.variables) {
+                        if (preset.variables[name] === undefined) {
+                            preset.variables[name] = parent.variables[name];
+                        }
+                    }
+                }
                 // Inherit other fields
                 let key: keyof PackagePreset;
                 for (key in parent) {
@@ -2251,6 +2170,10 @@ export function configureArgs(preset: ConfigurePreset): string[] {
     // CacheVariables
     if (preset.cacheVariables) {
         util.objectPairs(preset.cacheVariables).forEach(([key, value]) => {
+            // Skip $comment keys as they are only for documentation purposes
+            if (key === '$comment') {
+                return;
+            }
             if (util.isString(value) || typeof value === 'boolean') {
                 result.push(`-D${key}=${value}`);
             } else if (value) {
@@ -2315,11 +2238,18 @@ export function configureArgs(preset: ConfigurePreset): string[] {
     return result;
 }
 
-export function buildArgs(preset: BuildPreset, tempOverrideArgs?: string[], tempOverrideBuildToolArgs?: string[]): string[] {
+export function buildArgs(preset: BuildPreset, tempOverrideArgs?: string[], tempOverrideBuildToolArgs?: string[], fallbackJobs?: number): string[] {
     const result: string[] = [];
 
     preset.__binaryDir && result.push('--build', preset.__binaryDir);
-    preset.jobs && result.push('--parallel', preset.jobs.toString());
+    const jobs = preset.jobs ?? fallbackJobs;
+    if (jobs !== undefined) {
+        if (jobs === 0) {
+            result.push('-j');
+        } else {
+            result.push('--parallel', jobs.toString());
+        }
+    }
     preset.configuration && result.push('--config', preset.configuration);
     preset.cleanFirst && result.push('--clean-first');
     preset.verbose && result.push('--verbose');
@@ -2395,7 +2325,16 @@ export function testArgs(preset: TestPreset): string[] {
     if (preset.execution) {
         preset.execution.stopOnFailure && result.push('--stop-on-failure');
         preset.execution.enableFailover && result.push('-F');
-        preset.execution.jobs && result.push('--parallel', preset.execution.jobs.toString());
+        if (preset.execution.jobs !== undefined) {
+            // v11+: jobs can be an empty string meaning --parallel with no value (auto-detect).
+            // The API type currently declares jobs as number; will be updated to number | string.
+            const jobs = preset.execution.jobs as number | string;
+            if (jobs === '') {
+                result.push('--parallel');
+            } else {
+                result.push('--parallel', jobs.toString());
+            }
+        }
         preset.execution.resourceSpecFile && result.push('--resource-spec-file', preset.execution.resourceSpecFile);
         preset.execution.testLoad && result.push('--test-load', preset.execution.testLoad.toString());
         preset.execution.showOnly && result.push('--show-only', preset.execution.showOnly);

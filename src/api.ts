@@ -7,14 +7,14 @@ import * as vscode from 'vscode';
 import * as api from 'vscode-cmake-tools';
 import CMakeProject from '@cmt/cmakeProject';
 import { ExtensionManager } from '@cmt/extension';
-import { assertNever } from '@cmt/util';
+import { assertNever, checkDirectoryExists, platformNormalizePath } from '@cmt/util';
 import { CTestOutputLogger } from '@cmt/ctest';
 import { logEvent } from './telemetry';
 
 export class CMakeToolsApiImpl implements api.CMakeToolsApi {
     constructor(private readonly manager: ExtensionManager) {}
 
-    version: api.Version = api.Version.v4;
+    version: api.Version = api.Version.v5;
 
     showUIElement(element: api.UIElement): Promise<void> {
         logApiTelemetry('showUIElement');
@@ -40,7 +40,7 @@ export class CMakeToolsApiImpl implements api.CMakeToolsApi {
 
     async getProject(uri: vscode.Uri): Promise<CMakeProjectWrapper | undefined> {
         logApiTelemetry('getProject');
-        const project: CMakeProject | undefined = await this.manager.projectController.getProjectForFolder(uri.fsPath);
+        const project: CMakeProject | undefined = await this.getProjectForUri(uri);
         return project ? new CMakeProjectWrapper(project) : undefined;
     }
 
@@ -61,6 +61,31 @@ export class CMakeToolsApiImpl implements api.CMakeToolsApi {
                 assertNever(element);
         }
     }
+
+    private async getProjectForUri(uri: vscode.Uri): Promise<CMakeProject | undefined> {
+        if (await checkDirectoryExists(uri.fsPath)) {
+            const project = await this.manager.projectController.getProjectForFolder(uri.fsPath);
+            if (project) {
+                return project;
+            }
+        }
+
+        const normalizedPath = platformNormalizePath(uri.fsPath);
+        let bestMatch: CMakeProject | undefined;
+        let bestLength = -1;
+
+        for (const project of this.manager.projectController.getAllCMakeProjects()) {
+            for (const candidate of [project.sourceDir, project.workspaceFolder.uri.fsPath]) {
+                const normalizedCandidate = platformNormalizePath(candidate);
+                if ((normalizedPath === normalizedCandidate || normalizedPath.startsWith(`${normalizedCandidate}/`)) && normalizedCandidate.length > bestLength) {
+                    bestMatch = project;
+                    bestLength = normalizedCandidate.length;
+                }
+            }
+        }
+
+        return bestMatch;
+    }
 }
 
 async function withErrorCheck(name: string, action: () => Promise<api.CommandResult>): Promise<void> {
@@ -74,6 +99,7 @@ class CMakeProjectWrapper implements api.Project {
     constructor(private readonly project: CMakeProject) {}
 
     get codeModel() {
+        logApiTelemetry('getCodeModel');
         return this.project.codeModelContent ?? undefined;
     }
 
@@ -83,6 +109,35 @@ class CMakeProjectWrapper implements api.Project {
 
     get onSelectedConfigurationChanged() {
         return this.project.onSelectedConfigurationChangedApiEvent;
+    }
+
+    get onConfigureResult() {
+        return this.project.onConfigureResult;
+    }
+
+    get configurePreset() {
+        logApiTelemetry('getConfigurePreset');
+        return this.project.configurePreset ?? undefined;
+    }
+
+    get buildPreset() {
+        logApiTelemetry('getBuildPreset');
+        return this.project.buildPreset ?? undefined;
+    }
+
+    get testPreset() {
+        logApiTelemetry('getTestPreset');
+        return this.project.testPreset ?? undefined;
+    }
+
+    get packagePreset() {
+        logApiTelemetry('getPackagePreset');
+        return this.project.packagePreset ?? undefined;
+    }
+
+    get useCMakePresets() {
+        logApiTelemetry('getUseCMakePresets');
+        return this.project.useCMakePresets;
     }
 
     configure(): Promise<void> {

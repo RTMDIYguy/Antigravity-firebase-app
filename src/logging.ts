@@ -177,7 +177,8 @@ class SingletonLogger {
         });
         // Write to our output channel
         if (levelEnabled(level)) {
-            this._channel.appendLine(user_message);
+            const showTimestamps = vscode.workspace.getConfiguration('cmake').get('showTimestampsInOutput', false);
+            this._channel.appendLine(showTimestamps ? raw_message : user_message);
         }
     }
 
@@ -264,6 +265,9 @@ export class Logger {
             should_show = error_to_show;
         }
         const should_focus = (reveal_log === 'focus');
+        if (should_focus) {
+            should_show = true;
+        }
 
         if (should_show) {
             SingletonLogger.instance().showChannel(!should_focus);
